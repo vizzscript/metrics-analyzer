@@ -1,17 +1,13 @@
 #!/usr/bin/env node
-//CMD: ./log-metrics.js /home/ptspl03/Documents/PROD/Consumer/2025-05-16_clevertap.log --html
+
 const fs = require('fs');
 const readline = require('readline');
 const path = require('path');
 
-// Regex patterns
-const timestampRegex = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/;
-const logLevelRegex = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\w+):/;
-const jobCompletedRegex = /Job ID (\d+) completed successfully/;
-const messageCompletedRegex = /wabaNumber (\d+) ::: (\d+) ::: Completed successfully with wamid: ([a-z0-9]+) ::: Clevertap MsgID: ([A-Z0-9-]+)/;
-const storeSuccessRegex = /(\d+) ::: CleverTapStoreWamidMsgidService: ([a-z0-9]+) ::: ([A-Z0-9-]+) stored successfully/;
-const cacheHitRegex = /Cache hit for wabaNumber: (\d+)/;
-const errorRegex = /(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (error|warn):(.*)/i;
+// Regex patterns for specific message types within JSON message field
+const moengageCallbackRegex = /Moengage Callback, message: ({.*})/;
+const errorRegex = /error/i;
+const warningRegex = /warn/i;
 
 // Command line arguments handling
 const args = process.argv.slice(2);
@@ -42,7 +38,7 @@ let metrics = {
   wabaMessageMap: {}, // Track messages per WABA
   timeIntervals: {}, // Track operations by minute
   processingTimes: [], // Track time between message send and storage
-  messagesToStore: {} // Track messages waiting to be stored to calculate processing time
+  messagesToStore: {} // Track messages waiting to be stored
 };
 
 (async () => {
@@ -54,22 +50,23 @@ let metrics = {
 
     // Process each line of the log file
     for await (const line of rl) {
-      // Extract timestamp and log level
-      const logLevelMatch = line.match(logLevelRegex);
-      if (logLevelMatch) {
-        const timestamp = logLevelMatch[1];
-        const level = logLevelMatch[2].toLowerCase();
-        
+      try {
+        // Parse JSON log entry
+        const logEntry = JSON.parse(line);
+
+        const { level, message, '@timestamp': timestamp, logger_name } = logEntry;
+
         // Track log levels
-        metrics.logLevels[level] = (metrics.logLevels[level] || 0) + 1;
-        
+        const levelLower = level.toLowerCase();
+        metrics.logLevels[levelLower] = (metrics.logLevels[levelLower] || 0) + 1;
+
         // Update timestamp range
         const logTime = new Date(timestamp);
         if (!metrics.startTime || logTime < metrics.startTime) metrics.startTime = logTime;
         if (!metrics.endTime || logTime > metrics.endTime) metrics.endTime = logTime;
-        
+
         // Track time intervals (by minute)
-        const timeKey = timestamp.substring(0, 16); // YYYY-MM-DD HH:MM
+        const timeKey = timestamp.substring(0, 16); // YYYY-MM-DDTHH:MM
         if (!metrics.timeIntervals[timeKey]) {
           metrics.timeIntervals[timeKey] = {
             messages: 0,
@@ -78,125 +75,68 @@ let metrics = {
             stores: 0
           };
         }
-        
+
         // Detect errors and warnings
-        if (level === 'error') {
-          metrics.errors.push({ timestamp, message: line });
-        } else if (level === 'warn') {
-          metrics.warnings.push({ timestamp, message: line });
+        if (levelLower === 'error') {
+          metrics.errors.push({ timestamp, message });
+        } else if (levelLower === 'warn') {
+          metrics.warnings.push({ timestamp, message });
         }
-      }
 
-      // Track completed jobs
-      const jobMatch = line.match(jobCompletedRegex);
-      if (jobMatch) {
-        metrics.completedJobs++;
-        metrics.jobIds.add(jobMatch[1]);
-        
-        // Update time interval metrics
-        const timestampMatch = line.match(timestampRegex);
-        if (timestampMatch) {
-          const timeKey = timestampMatch[1].substring(0, 16);
-          if (metrics.timeIntervals[timeKey]) {
-            metrics.timeIntervals[timeKey].jobs++;
-          }
-        }
-      }
+        // Process Moengage Callback messages
+        const moengageMatch = message.match(moengageCallbackRegex);
+        if (moengageMatch && logger_name.includes('MoengageCallbackController')) {
+          try {
+            const callbackData = JSON.parse(moengageMatch[1]);
+            const entry = callbackData.entry?.[0];
+            const change = entry?.changes?.[0];
+            const value = change?.value;
+            const status = value?.statuses?.[0];
 
-      // Track messages sent
-      const messageMatch = line.match(messageCompletedRegex);
-      if (messageMatch) {
-        const wabaNumber = messageMatch[1];
-        const identifier = messageMatch[2];
-        const wamid = messageMatch[3];
-        const msgId = messageMatch[4];
-        
-        metrics.messagesSent++;
-        metrics.uniqueWabaNumbers.add(wabaNumber);
-        metrics.wamids.add(wamid);
-        metrics.messageIds.add(msgId);
-        
-        // Track message per WABA
-        if (!metrics.wabaMessageMap[wabaNumber]) {
-          metrics.wabaMessageMap[wabaNumber] = {
-            messageIds: new Set(),
-            wamids: new Set(),
-            count: 0
-          };
-        }
-        metrics.wabaMessageMap[wabaNumber].messageIds.add(msgId);
-        metrics.wabaMessageMap[wabaNumber].wamids.add(wamid);
-        metrics.wabaMessageMap[wabaNumber].count++;
-        
-        // Track for processing time calculation
-        metrics.messagesToStore[wamid] = {
-          wabaNumber,
-          msgId,
-          sentTimestamp: line.match(timestampRegex)?.[1]
-        };
-        
-        // Update time interval metrics
-        const timestampMatch = line.match(timestampRegex);
-        if (timestampMatch) {
-          const timeKey = timestampMatch[1].substring(0, 16);
-          if (metrics.timeIntervals[timeKey]) {
-            metrics.timeIntervals[timeKey].messages++;
-          }
-        }
-      }
+            if (status && status.status === 'read') {
+              const wabaNumber = value.metadata?.phone_number_id;
+              const wamid = status.id;
+              const recipientId = status.recipient_id;
+              const bizData = status.biz_opaque_callback_data ? JSON.parse(status.biz_opaque_callback_data) : {};
+              const msgId = bizData.msg_id;
 
-      // Track store operations
-      const storeMatch = line.match(storeSuccessRegex);
-      if (storeMatch) {
-        const wabaNumber = storeMatch[1];
-        const wamid = storeMatch[2];
-        const msgId = storeMatch[3];
-        
-        metrics.storeOperations++;
-        
-        // Calculate processing time if we have the original message
-        if (metrics.messagesToStore[wamid]) {
-          const sentTime = metrics.messagesToStore[wamid].sentTimestamp;
-          const storeTime = line.match(timestampRegex)?.[1];
-          
-          if (sentTime && storeTime) {
-            const processingTimeMs = new Date(storeTime) - new Date(sentTime);
-            metrics.processingTimes.push({
-              wamid,
-              msgId,
-              wabaNumber,
-              processingTimeMs
-            });
-          }
-          
-          // Remove from tracking
-          delete metrics.messagesToStore[wamid];
-        }
-        
-        // Update time interval metrics
-        const timestampMatch = line.match(timestampRegex);
-        if (timestampMatch) {
-          const timeKey = timestampMatch[1].substring(0, 16);
-          if (metrics.timeIntervals[timeKey]) {
-            metrics.timeIntervals[timeKey].stores++;
-          }
-        }
-      }
+              metrics.messagesSent++;
+              metrics.uniqueWabaNumbers.add(wabaNumber);
+              metrics.wamids.add(wamid);
+              metrics.messageIds.add(msgId);
 
-      // Track cache hits
-      const cacheMatch = line.match(cacheHitRegex);
-      if (cacheMatch) {
-        metrics.cacheHits++;
-        metrics.uniqueWabaNumbers.add(cacheMatch[1]);
-        
-        // Update time interval metrics
-        const timestampMatch = line.match(timestampRegex);
-        if (timestampMatch) {
-          const timeKey = timestampMatch[1].substring(0, 16);
-          if (metrics.timeIntervals[timeKey]) {
-            metrics.timeIntervals[timeKey].cacheHits++;
+              // Track message per WABA
+              if (!metrics.wabaMessageMap[wabaNumber]) {
+                metrics.wabaMessageMap[wabaNumber] = {
+                  messageIds: new Set(),
+                  wamids: new Set(),
+                  count: 0
+                };
+              }
+              metrics.wabaMessageMap[wabaNumber].messageIds.add(msgId);
+              metrics.wabaMessageMap[wabaNumber].wamids.add(wamid);
+              metrics.wabaMessageMap[wabaNumber].count++;
+
+              // Track for processing time calculation
+              metrics.messagesToStore[wamid] = {
+                wabaNumber,
+                msgId,
+                sentTimestamp: timestamp
+              };
+
+              // Update time interval metrics
+              metrics.timeIntervals[timeKey].messages++;
+            }
+          } catch (parseError) {
+            console.error(`Error parsing Moengage callback data: ${parseError.message}`);
           }
         }
+
+        // Note: No store operations, cache hits, or job completions in provided log sample
+        // These would need additional regex or logic based on specific log patterns
+      } catch (parseError) {
+        console.error(`Error parsing log line: ${parseError.message}`);
+        continue;
       }
     }
 
@@ -209,24 +149,24 @@ let metrics = {
 
       const durationMs = metrics.endTime - metrics.startTime;
       const durationSeconds = durationMs / 1000;
-      
+
       // Calculate message processing times
       let totalProcessingTime = 0;
       let minProcessingTime = Number.MAX_SAFE_INTEGER;
       let maxProcessingTime = 0;
-      
+
       metrics.processingTimes.forEach(item => {
         totalProcessingTime += item.processingTimeMs;
         minProcessingTime = Math.min(minProcessingTime, item.processingTimeMs);
         maxProcessingTime = Math.max(maxProcessingTime, item.processingTimeMs);
       });
-      
-      const avgProcessingTime = metrics.processingTimes.length > 0 ? 
+
+      const avgProcessingTime = metrics.processingTimes.length > 0 ?
         totalProcessingTime / metrics.processingTimes.length : 0;
-      
+
       // Sort time intervals for trend analysis
       const sortedIntervals = Object.keys(metrics.timeIntervals).sort();
-      
+
       // Calculate peak throughput
       let peakMessages = 0;
       let peakInterval = '';
@@ -236,12 +176,11 @@ let metrics = {
           peakInterval = interval;
         }
       });
-      
-      // Message success rate
-      const successRate = metrics.messagesSent > 0 ? 
+
+      // Message success rate (no store operations in sample, so assuming 0 for now)
+      const successRate = metrics.messagesSent > 0 ?
         (metrics.storeOperations / metrics.messagesSent) * 100 : 0;
-      
-      // Format metrics for output
+
       return {
         startTime: metrics.startTime.toISOString(),
         endTime: metrics.endTime.toISOString(),
@@ -265,28 +204,32 @@ let metrics = {
           count: metrics.uniqueWabaNumbers.size,
           messageDistribution: Object.fromEntries(
             Object.entries(metrics.wabaMessageMap).map(([wabaNumber, data]) => [
-              wabaNumber, 
+              wabaNumber,
               {
                 messages: data.count,
                 uniqueMessageIds: data.messageIds.size,
                 uniqueWamids: data.wamids.size,
-                percentOfTotal: ((data.count / metrics.messagesSent) * 100).toFixed(2) + '%'
+                percentOfTotal: metrics.messagesSent > 0 ?
+                  ((data.count / metrics.messagesSent) * 100).toFixed(2) + '%' : '0%'
               }
             ])
           )
         },
         cacheMetrics: {
           hits: metrics.cacheHits,
-          hitsPerWabaNumber: (metrics.cacheHits / metrics.uniqueWabaNumbers.size).toFixed(2)
+          hitsPerWabaNumber: metrics.uniqueWabaNumbers.size > 0 ?
+            (metrics.cacheHits / metrics.uniqueWabaNumbers.size).toFixed(2) : '0'
         },
         storeOperations: metrics.storeOperations,
         messageIds: {
           unique: metrics.messageIds.size,
-          ratio: (metrics.messageIds.size / metrics.messagesSent).toFixed(4)
+          ratio: metrics.messagesSent > 0 ?
+            (metrics.messageIds.size / metrics.messagesSent).toFixed(4) : '0'
         },
         wamids: {
           unique: metrics.wamids.size,
-          ratio: (metrics.wamids.size / metrics.messagesSent).toFixed(4)
+          ratio: metrics.messagesSent > 0 ?
+            (metrics.wamids.size / metrics.messagesSent).toFixed(4) : '0'
         },
         processing: {
           avgTimeMs: avgProcessingTime.toFixed(2),
@@ -313,14 +256,14 @@ let metrics = {
 
     // Generate final metrics
     const finalMetrics = calculateMetrics();
-    
+
     // Output based on format
     if (outputFormat === 'json' || outputFormat === 'all') {
       const outputFile = path.join(path.dirname(logFile), 'log-metrics.json');
       fs.writeFileSync(outputFile, JSON.stringify(finalMetrics, null, 2));
       console.log(`JSON metrics saved to: ${outputFile}`);
     }
-    
+
     if (outputFormat === 'console' || outputFormat === 'all') {
       console.log('Log Metrics Summary:');
       console.log(`Duration: ${finalMetrics.duration.seconds}s (${finalMetrics.duration.minutes} min)`);
@@ -331,12 +274,12 @@ let metrics = {
       console.log(`Completed Jobs: ${finalMetrics.jobs.total}`);
       console.log(`Average Processing Time: ${finalMetrics.processing.avgTimeMs}ms`);
       console.log(`Peak Throughput: ${finalMetrics.throughput.peakMessagesPerMinute} messages/min at ${finalMetrics.throughput.peakInterval}`);
-      
+
       if (finalMetrics.errors.length) {
         console.log(`\nErrors detected: ${finalMetrics.errors.length}`);
       }
     }
-    
+
     if (outputFormat === 'html' || outputFormat === 'all') {
       // Generate HTML report
       const htmlReport = generateHtmlReport(finalMetrics);
@@ -344,7 +287,7 @@ let metrics = {
       fs.writeFileSync(outputFile, htmlReport);
       console.log(`HTML report generated at: ${outputFile}`);
     }
-    
+
   } catch (err) {
     console.error('Error processing log file:', err);
     process.exit(1);
